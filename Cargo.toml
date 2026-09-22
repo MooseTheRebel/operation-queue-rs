@@ -15,6 +15,7 @@ all-features = true
 
 [features]
 line_token = []
+send = []
 
 [dependencies]
 futures = "0.3.28"
@@ -25,4 +26,4 @@ log = "0.4.21"
 thiserror = "1.0.56"
 
 [dev-dependencies]
-tokio = { version = "1.50.0", features = ["macros", "rt", "time"] }
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

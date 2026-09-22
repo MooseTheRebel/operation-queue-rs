@@ -202,7 +202,7 @@ impl OperationQueue {
 
 /// The status of a runner.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RunnerState {
+pub(crate) enum RunnerState {
     /// The runner has been created but isn't running yet.
     Pending,
 
