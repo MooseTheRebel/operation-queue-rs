@@ -2,14 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! `Send`-safe variant of the operation queue, used when the `send` feature
-//! is enabled. See the crate's top-level documentation.
+//! This module defines the types and data structures for the operation queue.
+//! See the crate's top-level documentation.
+//!
+//! The `QueuedOperation`/`ErasedQueuedOperation` traits and the `SpawnTaskFn`
+//! alias are the only parts of this queue that differ between the non-`Send`
+//! and `Send`-safe (`send` feature) variants, so they're the only parts kept
+//! in separate submodules, selected below.
 
 use std::{
     cell::RefCell,
-    fmt::Debug,
-    future::Future,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -17,42 +19,47 @@ use async_channel::{Receiver, Sender};
 
 use crate::{error::Error, runner_state::RunnerState};
 
-/// An operation that can be added to an [`OperationQueue`]. `Send`-safe
-/// counterpart to the non-`send`-feature `QueuedOperation`, for use with e.g.
-/// `tokio::spawn` on a multi-threaded runtime.
-pub trait QueuedOperation: Debug + Send {
-    fn perform(&self) -> impl Future<Output = ()> + Send;
-}
-
-/// A dyn-compatible version of [`QueuedOperation`], implemented for all types
-/// that implement it. See `local_thread::ErasedQueuedOperation` for why this
-/// is necessary.
-pub trait ErasedQueuedOperation: Debug + Send {
-    fn perform<'op>(&'op self) -> Pin<Box<dyn Future<Output = ()> + Send + 'op>>;
-}
-
-impl<T> ErasedQueuedOperation for T
-where
-    T: QueuedOperation,
-{
-    fn perform<'op>(&'op self) -> Pin<Box<dyn Future<Output = ()> + Send + 'op>> {
-        Box::pin(QueuedOperation::perform(self))
+cfg_select! {
+    feature = "send" => {
+        mod multi_thread;
+        pub use multi_thread::*;
+    }
+    _ => {
+        mod local_thread;
+        pub use local_thread::*;
     }
 }
 
-/// A queue that performs asynchronous operations in order. `Send`-safe
-/// counterpart to the non-`send`-feature `OperationQueue`.
+/// A queue that performs asynchronous operations in order.
+//
+// Design considerations:
+//
+//  * A previous approach involved using a `VecDeque` as the queue's inner
+//    buffer, but relying on `async_channel` allows simplifying the queue's
+//    structure, as well as the logic for waiting for new items to become
+//    available.
+//
+//  * `Arc` is used to keep track of runners in a way that ensures memory is
+//    properly managed. For compatibility with current Thunderbird code, the
+//    queue's item type (`ErasedQueuedOperation`) does not include a bound on
+//    `Send` and/or `Sync` by default, so `Rc` could be used instead there.
+//    However, we plan to, at a later time, address the current thread safety
+//    issues within the Thunderbird code base which currently prevent
+//    dispatching runners across multiple threads. In this context, we believe
+//    using `Arc` right away will avoid a hefty change in the future (at a
+//    negligible performance cost).
 pub struct OperationQueue {
     channel_sender: Sender<Box<dyn ErasedQueuedOperation>>,
     channel_receiver: Receiver<Box<dyn ErasedQueuedOperation>>,
     runners: RefCell<Vec<Arc<Runner>>>,
-    spawn_task: fn(fut: Pin<Box<dyn Future<Output = ()> + Send>>),
+    spawn_task: SpawnTaskFn,
 }
 
 impl OperationQueue {
     /// Creates a new operation queue. `spawn_task` spawns new runners, e.g.
-    /// `tokio::spawn`, and must not be blocking.
-    pub fn new(spawn_task: fn(fut: Pin<Box<dyn Future<Output = ()> + Send>>)) -> OperationQueue {
+    /// `tokio::task::spawn_local` or `tokio::spawn`, and must not be
+    /// blocking.
+    pub fn new(spawn_task: SpawnTaskFn) -> OperationQueue {
         let (snd, rcv) = async_channel::unbounded();
 
         OperationQueue {
@@ -94,6 +101,8 @@ impl OperationQueue {
             log::warn!("request queue: attempted to close channel that's already closed");
         }
 
+        // Clear the references we have on the runners, so they can be dropped
+        // when they finish running.
         self.runners.borrow_mut().clear();
     }
 
@@ -133,8 +142,8 @@ impl OperationQueue {
 struct Runner {
     receiver: Receiver<Box<dyn ErasedQueuedOperation>>,
 
-    // `Mutex` rather than a `Cell`: `Arc<Runner>` is only `Send` if `Runner`
-    // is `Sync` too.
+    // A `Mutex` (rather than a `Cell`) so `Runner` is `Sync`, which
+    // `Arc<Runner>` needs to be `Send` when the `send` feature is enabled.
     state: Mutex<RunnerState>,
 
     // Used for debugging.
@@ -144,6 +153,7 @@ struct Runner {
 impl Runner {
     /// Creates a new [`Runner`], wrapped in an [`Arc`] since [`Runner::run`]
     /// requires it.
+    #[allow(clippy::arc_with_non_send_sync)]
     fn new(id: u32, receiver: Receiver<Box<dyn ErasedQueuedOperation>>) -> Arc<Runner> {
         Arc::new(Runner {
             id,
@@ -186,6 +196,10 @@ impl Runner {
 }
 
 #[cfg(test)]
+// For simplicity, non-`send` tests run using tokio's local runtime via the
+// unstable "local" value for `tokio::test`'s `flavor` argument, which
+// requires the `tokio_unstable` cfg and triggers an "unexpected cfg" warning
+// otherwise.
 #[allow(unexpected_cfgs)]
 mod tests {
     use super::*;
@@ -193,36 +207,43 @@ mod tests {
     use async_channel::Sender;
     use tokio::time::Duration;
 
-    fn assert_send<T: Send>() {}
-
-    #[test]
-    fn operation_queue_is_send() {
-        assert_send::<OperationQueue>();
-    }
-
+    #[cfg(feature = "send")]
     fn new_queue() -> OperationQueue {
         OperationQueue::new(|fut| {
             _ = tokio::spawn(fut);
         })
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(not(feature = "send"))]
+    fn new_queue() -> OperationQueue {
+        OperationQueue::new(|fut| {
+            _ = tokio::task::spawn_local(fut);
+        })
+    }
+
+    #[cfg_attr(feature = "send", tokio::test)]
+    #[cfg_attr(not(feature = "send"), tokio::test(flavor = "local"))]
     async fn start_queue() {
         let queue = new_queue();
 
         queue.start(5).unwrap();
         assert_eq!(queue.runners.borrow().len(), 5);
 
+        // We need to await something to give the runners a chance to start
+        // their loops.
         tokio::time::sleep(Duration::from_millis(0)).await;
         assert!(queue.idle());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(feature = "send", tokio::test)]
+    #[cfg_attr(not(feature = "send"), tokio::test(flavor = "local"))]
     async fn stop_queue() {
         let queue = new_queue();
 
         queue.start(5).unwrap();
 
+        // We need to await something to give the runners a chance to start
+        // their loops.
         tokio::time::sleep(Duration::from_millis(0)).await;
         assert!(queue.idle());
 
@@ -236,6 +257,7 @@ mod tests {
             Err(_) => panic!("unexpected error"),
         }
 
+        // Try to enqueue a dummy operation to make sure it fails.
         #[derive(Debug)]
         struct Operation {}
         impl QueuedOperation for Operation {
@@ -250,8 +272,11 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn operation_order_across_threads() {
+    #[cfg_attr(feature = "send", tokio::test)]
+    #[cfg_attr(not(feature = "send"), tokio::test(flavor = "local"))]
+    async fn operation_order() {
+        // A simple operation with a numerical ID that sends its own ID through
+        // a channel.
         #[derive(Debug)]
         struct Operation {
             id: u8,
@@ -265,8 +290,10 @@ mod tests {
 
         let queue = new_queue();
 
+        // Create a channel the operations can use to send us their ID.
         let (sender, receiver) = async_channel::unbounded();
 
+        // Enqueue a couple of operations.
         queue
             .enqueue(Box::new(Operation {
                 id: 1,
@@ -283,13 +310,19 @@ mod tests {
             .await
             .unwrap();
 
+        // Start exactly one runner so we can check that operations run in
+        // order.
         queue.start(1).unwrap();
 
+        // Check that we got both IDs in order.
         let id = receiver.recv().await.unwrap();
         assert_eq!(id, 1);
         let id = receiver.recv().await.unwrap();
         assert_eq!(id, 2);
 
+        // For bonus points: the queue should be fully idle now. We need to
+        // await something first to give the runner a chance to go back to
+        // waiting for the next operation.
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(queue.idle());
     }

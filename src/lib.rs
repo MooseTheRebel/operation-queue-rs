@@ -71,13 +71,5 @@ pub use error::*;
 
 mod runner_state;
 
-// Exposed at the top level; which variant compiles depends on `send`.
-#[cfg(not(feature = "send"))]
-mod local_thread;
-#[cfg(not(feature = "send"))]
-pub use local_thread::*;
-
-#[cfg(feature = "send")]
-mod multi_thread;
-#[cfg(feature = "send")]
-pub use multi_thread::*;
+mod operation_queue;
+pub use operation_queue::*;
