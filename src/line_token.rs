@@ -40,7 +40,7 @@
 //!   token, as another future should have taken care of performing the
 //!   operation.
 //!
-//! [`OperationQueue`]: crate::operation_queue::OperationQueue
+//! [`OperationQueue`]: crate::OperationQueue
 //! [`Future`]: std::future::Future
 //! [`Rc`]: std::rc::Rc
 //! [`Arc`]: std::sync::Arc

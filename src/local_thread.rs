@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! This module defines the types and data structures for the operation queue.
-//! See the crate's top-level documentation.
+//! Non-`Send` variant of the operation queue, used when the `send` feature is
+//! disabled. See the crate's top-level documentation.
 
 use std::{
     cell::{Cell, RefCell},
@@ -15,7 +15,7 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 
-use crate::error::Error;
+use crate::{error::Error, runner_state::RunnerState};
 
 /// An operation that can be added to an [`OperationQueue`].
 #[allow(async_fn_in_trait)]
@@ -198,23 +198,6 @@ impl OperationQueue {
     {
         self.runners.borrow().iter().filter(predicate).count()
     }
-}
-
-/// The status of a runner.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RunnerState {
-    /// The runner has been created but isn't running yet.
-    Pending,
-
-    /// The runner is currently waiting for an operation to perform.
-    Waiting,
-
-    /// The runner is currently performing an operation.
-    Running,
-
-    /// The runner has finished performing its last operation and has exited its
-    /// main loop.
-    Stopped,
 }
 
 /// A runner created and run by the [`OperationQueue`].

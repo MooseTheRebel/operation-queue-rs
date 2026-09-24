@@ -54,11 +54,11 @@
 //!
 //! The synchronization helpers in the [`line_token`] module are thread-safe.
 //!
-//! [`OperationQueue`] and its operations are not required to be [`Send`], so
-//! its runners must be spawned locally (e.g. `tokio::task::spawn_local`). The
-//! `send` feature adds [`SendQueuedOperation`] and [`SendOperationQueue`] for
-//! use with `tokio::spawn` on a multi-threaded runtime instead; see their docs
-//! for details.
+//! By default, [`OperationQueue`] and its operations are not required to be
+//! [`Send`], so its runners must be spawned locally (e.g.
+//! `tokio::task::spawn_local`). Enabling the `send` feature swaps in a
+//! `Send`-safe variant instead, for use with `tokio::spawn` on a
+//! multi-threaded runtime — only one variant is compiled at a time.
 //!
 //! [dyn compatibility]:
 //!     <https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility>
@@ -66,13 +66,18 @@
 #[cfg(feature = "line_token")]
 pub mod line_token;
 
-// The queue is the main feature from this crate, so expose it at the top-level.
 mod error;
-mod operation_queue;
 pub use error::*;
-pub use operation_queue::*;
+
+mod runner_state;
+
+// Exposed at the top level; which variant compiles depends on `send`.
+#[cfg(not(feature = "send"))]
+mod local_thread;
+#[cfg(not(feature = "send"))]
+pub use local_thread::*;
 
 #[cfg(feature = "send")]
-mod send_operation_queue;
+mod multi_thread;
 #[cfg(feature = "send")]
-pub use send_operation_queue::*;
+pub use multi_thread::*;

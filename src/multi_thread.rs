@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! `Send`-safe variant of the operation queue, gated behind the `send`
-//! feature.
+//! `Send`-safe variant of the operation queue, used when the `send` feature
+//! is enabled. See the crate's top-level documentation.
 
 use std::{
     cell::RefCell,
@@ -15,58 +15,47 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 
-use crate::{error::Error, operation_queue::RunnerState};
+use crate::{error::Error, runner_state::RunnerState};
 
-/// `Send`-safe counterpart to [`QueuedOperation`], kept as a separate trait so
-/// existing non-`Send` implementations still compile under the `send`
-/// feature.
-///
-/// [`QueuedOperation`]: crate::QueuedOperation
-pub trait SendQueuedOperation: Debug + Send {
+/// An operation that can be added to an [`OperationQueue`]. `Send`-safe
+/// counterpart to the non-`send`-feature `QueuedOperation`, for use with e.g.
+/// `tokio::spawn` on a multi-threaded runtime.
+pub trait QueuedOperation: Debug + Send {
     fn perform(&self) -> impl Future<Output = ()> + Send;
 }
 
-/// Dyn-compatible version of [`SendQueuedOperation`]. See
-/// [`ErasedQueuedOperation`] for why this is necessary.
-///
-/// [`ErasedQueuedOperation`]: crate::ErasedQueuedOperation
-pub trait ErasedSendQueuedOperation: Debug + Send {
+/// A dyn-compatible version of [`QueuedOperation`], implemented for all types
+/// that implement it. See `local_thread::ErasedQueuedOperation` for why this
+/// is necessary.
+pub trait ErasedQueuedOperation: Debug + Send {
     fn perform<'op>(&'op self) -> Pin<Box<dyn Future<Output = ()> + Send + 'op>>;
 }
 
-impl<T> ErasedSendQueuedOperation for T
+impl<T> ErasedQueuedOperation for T
 where
-    T: SendQueuedOperation,
+    T: QueuedOperation,
 {
     fn perform<'op>(&'op self) -> Pin<Box<dyn Future<Output = ()> + Send + 'op>> {
-        Box::pin(SendQueuedOperation::perform(self))
+        Box::pin(QueuedOperation::perform(self))
     }
 }
 
-/// `Send`-safe counterpart to [`OperationQueue`]; its runners' futures are
-/// `Send`, so they can be spawned with e.g. `tokio::spawn` on tokio's
-/// multi-threaded runtime. Takes [`SendQueuedOperation`] instead of
-/// [`QueuedOperation`].
-///
-/// [`OperationQueue`]: crate::OperationQueue
-/// [`QueuedOperation`]: crate::QueuedOperation
-pub struct SendOperationQueue {
-    channel_sender: Sender<Box<dyn ErasedSendQueuedOperation>>,
-    channel_receiver: Receiver<Box<dyn ErasedSendQueuedOperation>>,
-    runners: RefCell<Vec<Arc<SendRunner>>>,
+/// A queue that performs asynchronous operations in order. `Send`-safe
+/// counterpart to the non-`send`-feature `OperationQueue`.
+pub struct OperationQueue {
+    channel_sender: Sender<Box<dyn ErasedQueuedOperation>>,
+    channel_receiver: Receiver<Box<dyn ErasedQueuedOperation>>,
+    runners: RefCell<Vec<Arc<Runner>>>,
     spawn_task: fn(fut: Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 
-impl SendOperationQueue {
-    /// See [`OperationQueue::new`].
-    ///
-    /// [`OperationQueue::new`]: crate::OperationQueue::new
-    pub fn new(
-        spawn_task: fn(fut: Pin<Box<dyn Future<Output = ()> + Send>>),
-    ) -> SendOperationQueue {
+impl OperationQueue {
+    /// Creates a new operation queue. `spawn_task` spawns new runners, e.g.
+    /// `tokio::spawn`, and must not be blocking.
+    pub fn new(spawn_task: fn(fut: Pin<Box<dyn Future<Output = ()> + Send>>)) -> OperationQueue {
         let (snd, rcv) = async_channel::unbounded();
 
-        SendOperationQueue {
+        OperationQueue {
             channel_sender: snd,
             channel_receiver: rcv,
             runners: RefCell::new(Vec::new()),
@@ -74,16 +63,15 @@ impl SendOperationQueue {
         }
     }
 
-    /// See [`OperationQueue::start`].
-    ///
-    /// [`OperationQueue::start`]: crate::OperationQueue::start
+    /// Starts `runners` runners that consume items pushed to the queue.
+    /// Errors if the queue has previously been stopped.
     pub fn start(&self, runners: u32) -> Result<(), Error> {
         if self.channel_sender.is_closed() {
             return Err(Error::Stopped);
         }
 
         for i in 0..runners {
-            let runner = SendRunner::new(i, self.channel_receiver.clone());
+            let runner = Runner::new(i, self.channel_receiver.clone());
             (self.spawn_task)(Box::pin(runner.clone().run()));
             self.runners.borrow_mut().push(runner);
         }
@@ -91,17 +79,16 @@ impl SendOperationQueue {
         Ok(())
     }
 
-    /// See [`OperationQueue::enqueue`].
-    ///
-    /// [`OperationQueue::enqueue`]: crate::OperationQueue::enqueue
-    pub async fn enqueue(&self, op: Box<dyn ErasedSendQueuedOperation>) -> Result<(), Error> {
+    /// Pushes an operation to the back of the queue. Errors if the queue has
+    /// been stopped.
+    pub async fn enqueue(&self, op: Box<dyn ErasedQueuedOperation>) -> Result<(), Error> {
         self.channel_sender.send(op).await?;
         Ok(())
     }
 
-    /// See [`OperationQueue::stop`].
-    ///
-    /// [`OperationQueue::stop`]: crate::OperationQueue::stop
+    /// Stops the queue. Already-queued operations still run, but subsequent
+    /// [`start`](OperationQueue::start)/[`enqueue`](OperationQueue::enqueue)
+    /// calls will fail.
     pub async fn stop(&self) {
         if !self.channel_sender.close() {
             log::warn!("request queue: attempted to close channel that's already closed");
@@ -110,9 +97,8 @@ impl SendOperationQueue {
         self.runners.borrow_mut().clear();
     }
 
-    /// See [`OperationQueue::running`].
-    ///
-    /// [`OperationQueue::running`]: crate::OperationQueue::running
+    /// Checks whether one or more runners are currently active (any state
+    /// other than fully stopped, including pending).
     pub fn running(&self) -> bool {
         let active_runners =
             self.count_matching_runners(|runner| !matches!(runner.state(), RunnerState::Stopped));
@@ -122,9 +108,7 @@ impl SendOperationQueue {
         active_runners > 0
     }
 
-    /// See [`OperationQueue::idle`].
-    ///
-    /// [`OperationQueue::idle`]: crate::OperationQueue::idle
+    /// Checks whether all runners are currently waiting for an operation.
     pub fn idle(&self) -> bool {
         let idle_runners =
             self.count_matching_runners(|runner| matches!(runner.state(), RunnerState::Waiting));
@@ -134,37 +118,42 @@ impl SendOperationQueue {
         idle_runners == self.runners.borrow().len()
     }
 
+    /// Counts runners matching `predicate`. Panics if `self.runners` is
+    /// currently mutably borrowed.
     fn count_matching_runners<PredicateT>(&self, predicate: PredicateT) -> usize
     where
-        PredicateT: FnMut(&&Arc<SendRunner>) -> bool,
+        PredicateT: FnMut(&&Arc<Runner>) -> bool,
     {
         self.runners.borrow().iter().filter(predicate).count()
     }
 }
 
-/// See [`Runner`].
-///
-/// [`Runner`]: crate::operation_queue::Runner
-struct SendRunner {
-    receiver: Receiver<Box<dyn ErasedSendQueuedOperation>>,
+/// A runner created and run by the [`OperationQueue`]. Runs an infinite loop
+/// via [`Runner::run`] until the queue's channel is closed and drained.
+struct Runner {
+    receiver: Receiver<Box<dyn ErasedQueuedOperation>>,
 
-    // `Mutex` rather than `Runner`'s `Cell`, so `SendRunner` is `Sync`:
-    // `Arc<SendRunner>` is only `Send` if `SendRunner` is `Send` + `Sync`.
+    // `Mutex` rather than a `Cell`: `Arc<Runner>` is only `Send` if `Runner`
+    // is `Sync` too.
     state: Mutex<RunnerState>,
 
+    // Used for debugging.
     id: u32,
 }
 
-impl SendRunner {
-    fn new(id: u32, receiver: Receiver<Box<dyn ErasedSendQueuedOperation>>) -> Arc<SendRunner> {
-        Arc::new(SendRunner {
+impl Runner {
+    /// Creates a new [`Runner`], wrapped in an [`Arc`] since [`Runner::run`]
+    /// requires it.
+    fn new(id: u32, receiver: Receiver<Box<dyn ErasedQueuedOperation>>) -> Arc<Runner> {
+        Arc::new(Runner {
             id,
             receiver,
             state: Mutex::new(RunnerState::Pending),
         })
     }
 
-    async fn run(self: Arc<SendRunner>) {
+    /// Waits for and performs operations as they come down the channel.
+    async fn run(self: Arc<Runner>) {
         loop {
             *self.state.lock().expect("runner state lock poisoned") = RunnerState::Waiting;
 
@@ -182,7 +171,7 @@ impl SendRunner {
             *self.state.lock().expect("runner state lock poisoned") = RunnerState::Running;
 
             log::info!(
-                "operation_queue::SendRunner: runner {} performing op: {op:?}",
+                "operation_queue::Runner: runner {} performing op: {op:?}",
                 self.id
             );
 
@@ -190,6 +179,7 @@ impl SendRunner {
         }
     }
 
+    /// Gets the runner's current state.
     fn state(&self) -> RunnerState {
         *self.state.lock().expect("runner state lock poisoned")
     }
@@ -206,12 +196,12 @@ mod tests {
     fn assert_send<T: Send>() {}
 
     #[test]
-    fn send_operation_queue_is_send() {
-        assert_send::<SendOperationQueue>();
+    fn operation_queue_is_send() {
+        assert_send::<OperationQueue>();
     }
 
-    fn new_queue() -> SendOperationQueue {
-        SendOperationQueue::new(|fut| {
+    fn new_queue() -> OperationQueue {
+        OperationQueue::new(|fut| {
             _ = tokio::spawn(fut);
         })
     }
@@ -248,7 +238,7 @@ mod tests {
 
         #[derive(Debug)]
         struct Operation {}
-        impl SendQueuedOperation for Operation {
+        impl QueuedOperation for Operation {
             async fn perform(&self) {}
         }
 
@@ -267,7 +257,7 @@ mod tests {
             id: u8,
             sender: Sender<u8>,
         }
-        impl SendQueuedOperation for Operation {
+        impl QueuedOperation for Operation {
             async fn perform(&self) {
                 self.sender.send(self.id).await.unwrap();
             }

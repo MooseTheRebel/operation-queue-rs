@@ -61,12 +61,14 @@ async fn main() {
 
 ## Multithreading
 
-The `send` feature adds `SendQueuedOperation` and `SendOperationQueue`,
-`Send`-safe counterparts that let runners be spawned with `tokio::spawn` on
-a multi-threaded runtime instead:
+By default, `OperationQueue` and its operations are not required to be
+`Send`, so its runners must be spawned locally (as shown above). Enabling the
+`send` feature swaps in a `Send`-safe variant instead, for use with
+`tokio::spawn` on a multi-threaded runtime — only one variant is available in
+a given build:
 
 ```rust
-use operation_queue::{SendOperationQueue, SendQueuedOperation};
+use operation_queue::{OperationQueue, QueuedOperation};
 
 const OPERATION_COUNT: usize = 100;
 const RUNNER_COUNT: usize = 100;
@@ -75,7 +77,7 @@ struct Operation {
     // Fields...
 }
 
-impl SendQueuedOperation for Operation {
+impl QueuedOperation for Operation {
     async fn perform(&self) {
         // Perform the operation...
     }
@@ -83,7 +85,7 @@ impl SendQueuedOperation for Operation {
 
 #[tokio::main]
 async fn main() {
-    let queue = SendOperationQueue::new(|runner_fut| {
+    let queue = OperationQueue::new(|runner_fut| {
         let _ = tokio::spawn(runner_fut);
     });
 

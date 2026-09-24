@@ -23,11 +23,3 @@ impl From<SendError<Box<dyn ErasedQueuedOperation>>> for Error {
         Error::Sender
     }
 }
-
-#[cfg(feature = "send")]
-impl From<SendError<Box<dyn crate::send_operation_queue::ErasedSendQueuedOperation>>> for Error {
-    // `SendError` is only returned in one case: the channel is closed.
-    fn from(_: SendError<Box<dyn crate::send_operation_queue::ErasedSendQueuedOperation>>) -> Self {
-        Error::Sender
-    }
-}
