@@ -21,6 +21,13 @@ pub trait QueuedOperation: Debug {
 /// wrapping the opaque [`Future`] returned by `perform` into a [`Box`], which
 /// is essentially an owned pointer and which size is known at compile time.
 /// This makes `perform` dispatchable from a trait object.
+///
+/// This return value is further wrapped into a [`Pin`] so that the `Future` can
+/// be `await`ed (since the receiver for [`Future::poll`] is `Pin<&mut Self>`).
+///
+/// In this context, "erased" refers to how this trait "erases" the
+/// opaque/generic return type of [`QueuedOperation::perform`] by turning it
+/// into a trait object.
 pub trait ErasedQueuedOperation: Debug {
     fn perform<'op>(&'op self) -> Pin<Box<dyn Future<Output = ()> + 'op>>;
 }

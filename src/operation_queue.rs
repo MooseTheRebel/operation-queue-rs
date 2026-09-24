@@ -56,8 +56,10 @@ pub struct OperationQueue {
 }
 
 impl OperationQueue {
-    /// Creates a new operation queue. `spawn_task` spawns new runners, e.g.
-    /// `tokio::task::spawn_local` or `tokio::spawn`, and must not be
+    /// Creates a new operation queue.
+    ///
+    /// The function provided as argument is used when spawning new runners,
+    /// e.g. `tokio::task::spawn_local` or `tokio::spawn`. It must not be
     /// blocking.
     pub fn new(spawn_task: SpawnTaskFn) -> OperationQueue {
         let (snd, rcv) = async_channel::unbounded();
@@ -70,8 +72,12 @@ impl OperationQueue {
         }
     }
 
-    /// Starts `runners` runners that consume items pushed to the queue.
-    /// Errors if the queue has previously been stopped.
+    /// Starts the given number of runners that consume new items pushed to the
+    /// queue.
+    ///
+    /// A runner loops infinitely, performing operations as they get queued.
+    ///
+    /// An error can be returned if the queue has previously been stopped.
     pub fn start(&self, runners: u32) -> Result<(), Error> {
         if self.channel_sender.is_closed() {
             return Err(Error::Stopped);
@@ -86,16 +92,25 @@ impl OperationQueue {
         Ok(())
     }
 
-    /// Pushes an operation to the back of the queue. Errors if the queue has
-    /// been stopped.
+    /// Pushes an operation to the back of the queue.
+    ///
+    /// This function can be used with any type that implements
+    /// [`QueuedOperation`], since [`ErasedQueuedOperation`] is automatically
+    /// implemented for all such implementations.
+    ///
+    /// An error can be returned if the queue has been stopped.
     pub async fn enqueue(&self, op: Box<dyn ErasedQueuedOperation>) -> Result<(), Error> {
         self.channel_sender.send(op).await?;
         Ok(())
     }
 
-    /// Stops the queue. Already-queued operations still run, but subsequent
-    /// [`start`](OperationQueue::start)/[`enqueue`](OperationQueue::enqueue)
-    /// calls will fail.
+    /// Stops the queue.
+    ///
+    /// Operations that have already been queued up will still be performed, but
+    /// any call to [`start`] or [`enqueue`] following a call to `stop` will fail.
+    ///
+    /// [`start`]: OperationQueue::start
+    /// [`enqueue`]: OperationQueue::enqueue
     pub async fn stop(&self) {
         if !self.channel_sender.close() {
             log::warn!("request queue: attempted to close channel that's already closed");
@@ -106,29 +121,58 @@ impl OperationQueue {
         self.runners.borrow_mut().clear();
     }
 
-    /// Checks whether one or more runners are currently active (any state
-    /// other than fully stopped, including pending).
+    /// Checks whether one or more runner(s) is currently active.
+    ///
+    /// If a runner has been created but isn't running yet, it is still included
+    /// in this count. Thus a runner being active means it's in any state other
+    /// than fully stopped.
+    ///
+    /// This method also returns `false` if there aren't any runners (e.g. if
+    /// the queue hasn't been started yet, or it has been stopped).
     pub fn running(&self) -> bool {
+        // Count every runner that's not permanently stopped. This should be
+        // fine, since the only places we mutably borrow `self.runners` are
+        // `start` and `stop` and:
+        //  * both `start`, `stop` and `running` are expected to be run in the
+        //    same thread/routine, and
+        //  * both are synchronous functions so there should be no risk of one
+        //    happening while the other waits.
         let active_runners =
             self.count_matching_runners(|runner| !matches!(runner.state(), RunnerState::Stopped));
 
         log::debug!("{active_runners} runner(s) currently active");
 
+        // Check if there's at least one runner currently active.
         active_runners > 0
     }
 
-    /// Checks whether all runners are currently waiting for an operation.
+    /// Checks whether all runners are currently waiting for a new operation to
+    /// perform.
     pub fn idle(&self) -> bool {
+        // Count every runner that's waiting for a new operation to perform.
+        // This should be fine, since the only places we mutably borrow
+        // `self.runners` are `start` and `stop` and:
+        //  * both `start`, `stop` and `idle` are expected to be run in the
+        //    thread/routine, and
+        //  * both are synchronous functions so there should be no risk of one
+        //    happening while the other waits.
         let idle_runners =
             self.count_matching_runners(|runner| matches!(runner.state(), RunnerState::Waiting));
 
         log::debug!("{idle_runners} runner(s) currently idle");
 
+        // If `self.runner` was being mutably borrowed here, we would have
+        // already panicked when calling `self.count_matching_runners()`.
         idle_runners == self.runners.borrow().len()
     }
 
-    /// Counts runners matching `predicate`. Panics if `self.runners` is
-    /// currently mutably borrowed.
+    /// Counts the number of runners matching the given closure. The type of the
+    /// closure is the same that would be used by [`Iterator::filter`].
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if it's called while `self.runners` is being
+    /// mutably borrowed.
     fn count_matching_runners<PredicateT>(&self, predicate: PredicateT) -> usize
     where
         PredicateT: FnMut(&&Arc<Runner>) -> bool,
@@ -137,8 +181,14 @@ impl OperationQueue {
     }
 }
 
-/// A runner created and run by the [`OperationQueue`]. Runs an infinite loop
-/// via [`Runner::run`] until the queue's channel is closed and drained.
+/// A runner created and run by the [`OperationQueue`].
+///
+/// Each runner works by entering an infinite loop upon calling [`Runner::run`],
+/// which is only exited when the queue's channel is closed and has been
+/// emptied.
+///
+/// The current state of the runner can be checked at any time with
+/// [`Runner::state`].
 struct Runner {
     receiver: Receiver<Box<dyn ErasedQueuedOperation>>,
 
@@ -146,13 +196,21 @@ struct Runner {
     // `Arc<Runner>` needs to be `Send` when the `send` feature is enabled.
     state: Mutex<RunnerState>,
 
-    // Used for debugging.
+    // A numerical identifier attached to the current runner, used for
+    // debugging.
     id: u32,
 }
 
 impl Runner {
-    /// Creates a new [`Runner`], wrapped in an [`Arc`] since [`Runner::run`]
-    /// requires it.
+    /// Creates a new [`Runner`], wrapped into an [`Arc`].
+    ///
+    /// `id` is a numerical identifier used for debugging.
+    ///
+    /// Since [`Runner::run`] requires the queue to be wrapped inside an
+    /// [`Arc`], this is how this method returns the new queue.
+    //
+    // See the design consideration comment for `OperationQueue` regarding the
+    // use of `Arc`.
     #[allow(clippy::arc_with_non_send_sync)]
     fn new(id: u32, receiver: Receiver<Box<dyn ErasedQueuedOperation>>) -> Arc<Runner> {
         Arc::new(Runner {
@@ -162,7 +220,12 @@ impl Runner {
         })
     }
 
-    /// Waits for and performs operations as they come down the channel.
+    /// Starts a loop that waits for new operations to come down the inner
+    /// channel and performs them.
+    ///
+    /// This method does not explicitly take care of sharing the operation's
+    /// response to the consumer; this is expected to be done by
+    /// [`QueuedOperation::perform`].
     async fn run(self: Arc<Runner>) {
         loop {
             *self.state.lock().expect("runner state lock poisoned") = RunnerState::Waiting;
@@ -196,10 +259,11 @@ impl Runner {
 }
 
 #[cfg(test)]
-// For simplicity, non-`send` tests run using tokio's local runtime via the
-// unstable "local" value for `tokio::test`'s `flavor` argument, which
-// requires the `tokio_unstable` cfg and triggers an "unexpected cfg" warning
-// otherwise.
+// For simplicity, we run our non-`send` async tests using tokio's local
+// runtime using the unstable "local" value for the `flavor` argument in
+// `tokio::test`. Because it comes from tokio's unstable API, we need to
+// supply the `tokio_unstable` cfg condition, which in turn triggers a warning
+// from within the `tokio::test` macro about an unexpected cfg condition name.
 #[allow(unexpected_cfgs)]
 mod tests {
     use super::*;
