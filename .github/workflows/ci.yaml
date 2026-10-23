@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     name: Build & Test Project
 
+    # The `send` feature swaps `OperationQueue`'s implementation rather than
+    # adding to it, so test both variants instead of relying on --all-features.
+    strategy:
+      matrix:
+        features: [ "line_token", "line_token,send" ]
+
     steps:
     - name: Checkout source
       uses: actions/checkout@v4
@@ -36,23 +42,24 @@ jobs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build project
-      run: cargo build --all-features
+      run: cargo build --features "${{ matrix.features }}"
 
     - name: Test project
-      run: cargo test --all-features --workspace
+      run: cargo test --features "${{ matrix.features }}" --workspace
 
     - name: Run clippy
       uses: giraffate/clippy-action@v1
       with:
         reporter: 'github-pr-check'
-        clippy_flags: --no-deps --tests
+        clippy_flags: --no-deps --tests --features "${{ matrix.features }}"
         filter_mode: nofilter
         github_token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build docs
+      if: matrix.features == 'line_token,send'
       env:
         RUSTDOCFLAGS: -D warnings
       run: cargo doc --all-features --no-deps --workspace --document-private-items
