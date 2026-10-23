@@ -69,6 +69,5 @@ pub mod line_token;
 // The queue is the main feature from this crate, so expose it at the top-level.
 mod error;
 mod operation_queue;
-mod runner_state;
 pub use error::*;
 pub use operation_queue::*;

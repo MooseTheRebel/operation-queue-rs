@@ -17,18 +17,21 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 
-use crate::{error::Error, runner_state::RunnerState};
+use crate::error::Error;
 
-cfg_select! {
-    feature = "send" => {
-        mod multi_thread;
-        pub use multi_thread::*;
-    }
-    _ => {
-        mod local_thread;
-        pub use local_thread::*;
-    }
-}
+#[cfg(feature = "send")]
+mod multi_thread;
+#[cfg(feature = "send")]
+use multi_thread::SpawnTaskFn;
+#[cfg(feature = "send")]
+pub use multi_thread::{ErasedQueuedOperation, QueuedOperation};
+
+#[cfg(not(feature = "send"))]
+mod local_thread;
+#[cfg(not(feature = "send"))]
+use local_thread::SpawnTaskFn;
+#[cfg(not(feature = "send"))]
+pub use local_thread::{ErasedQueuedOperation, QueuedOperation};
 
 /// A queue that performs asynchronous operations in order.
 //
@@ -181,6 +184,23 @@ impl OperationQueue {
     }
 }
 
+/// The status of a runner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunnerState {
+    /// The runner has been created but isn't running yet.
+    Pending,
+
+    /// The runner is currently waiting for an operation to perform.
+    Waiting,
+
+    /// The runner is currently performing an operation.
+    Running,
+
+    /// The runner has finished performing its last operation and has exited its
+    /// main loop.
+    Stopped,
+}
+
 /// A runner created and run by the [`OperationQueue`].
 ///
 /// Each runner works by entering an infinite loop upon calling [`Runner::run`],
@@ -193,7 +213,7 @@ struct Runner {
     receiver: Receiver<Box<dyn ErasedQueuedOperation>>,
 
     // A `Mutex` (rather than a `Cell`) so `Runner` is `Sync`, which
-    // `Arc<Runner>` needs to be `Send` when the `send` feature is enabled.
+    // `Arc<Runner>` needs in order to be `Send` when the `send` feature is enabled.
     state: Mutex<RunnerState>,
 
     // A numerical identifier attached to the current runner, used for
@@ -228,7 +248,7 @@ impl Runner {
     /// [`QueuedOperation::perform`].
     async fn run(self: Arc<Runner>) {
         loop {
-            *self.state.lock().expect("runner state lock poisoned") = RunnerState::Waiting;
+            self.set_state(RunnerState::Waiting);
 
             let op = match self.receiver.recv().await {
                 Ok(op) => op,
@@ -236,12 +256,12 @@ impl Runner {
                     log::info!(
                         "request queue: channel has closed (likely due to client shutdown), exiting the loop"
                     );
-                    *self.state.lock().expect("runner state lock poisoned") = RunnerState::Stopped;
+                    self.set_state(RunnerState::Stopped);
                     return;
                 }
             };
 
-            *self.state.lock().expect("runner state lock poisoned") = RunnerState::Running;
+            self.set_state(RunnerState::Running);
 
             log::info!(
                 "operation_queue::Runner: runner {} performing op: {op:?}",
@@ -252,7 +272,28 @@ impl Runner {
         }
     }
 
+    /// Sets the runner's current state.
+    ///
+    /// # Panics
+    ///
+    /// This method can theoretically panic if the [`Mutex`] holding the
+    /// runner's state becomes poisoned, i.e. it's locked by a thread that has
+    /// now panicked. This shouldn't be a concern in practice, because
+    /// runners don't dispatch any of their own methods to other threads,
+    /// meaning that all locks should come from the same thread.
+    fn set_state(&self, state: RunnerState) {
+        *self.state.lock().expect("runner state lock poisoned") = state;
+    }
+
     /// Gets the runner's current state.
+    ///
+    /// # Panics
+    ///
+    /// This method can theoretically panic if the [`Mutex`] holding the
+    /// runner's state becomes poisoned, i.e. it's locked by a thread that has
+    /// now panicked. This shouldn't be a concern in practice, because
+    /// runners don't dispatch any of their own methods to other threads,
+    /// meaning that all locks should come from the same thread.
     fn state(&self) -> RunnerState {
         *self.state.lock().expect("runner state lock poisoned")
     }
