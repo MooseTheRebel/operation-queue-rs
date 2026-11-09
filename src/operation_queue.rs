@@ -19,14 +19,20 @@ use async_channel::{Receiver, Sender};
 
 use crate::error::Error;
 
-#[cfg(feature = "send")]
+#[cfg(docsrs)]
+#[doc(cfg(feature = "send"))]
+pub mod multi_thread;
+#[cfg(all(feature = "send", not(docsrs)))]
 mod multi_thread;
 #[cfg(feature = "send")]
 use multi_thread::SpawnTaskFn;
 #[cfg(feature = "send")]
 pub use multi_thread::{ErasedQueuedOperation, QueuedOperation};
 
-#[cfg(not(feature = "send"))]
+#[cfg(docsrs)]
+#[doc(cfg(not(feature = "send")))]
+pub mod local_thread;
+#[cfg(all(not(feature = "send"), not(docsrs)))]
 mod local_thread;
 #[cfg(not(feature = "send"))]
 use local_thread::SpawnTaskFn;
@@ -64,6 +70,9 @@ impl OperationQueue {
     /// The function provided as argument is used when spawning new runners,
     /// e.g. `tokio::task::spawn_local` or `tokio::spawn`. It must not be
     /// blocking.
+    ///
+    /// Its type is `fn(Pin<Box<dyn Future<Output = ()> + Send>>)` with the
+    /// `send` feature, and `fn(Pin<Box<dyn Future<Output = ()>>>)` without it.
     pub fn new(spawn_task: SpawnTaskFn) -> OperationQueue {
         let (snd, rcv) = async_channel::unbounded();
 
